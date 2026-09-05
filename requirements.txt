@@ -1,0 +1,160 @@
+# =============================================================================
+# Indra — Hyper-Localized Indian Weather Nowcasting
+# Core runtime dependencies (training, inference, GIS, RAG, API)
+#
+# Exact pins throughout. A research build that cannot be reproduced byte-for-
+# byte is not reproducible, and the geospatial/meteorological stack in
+# particular is sensitive to minor-version drift between numpy, GDAL and the
+# ecCodes bindings.
+#
+# SYSTEM DEPENDENCIES (installed via apt in the root Dockerfile, NOT pip):
+#   libeccodes0 libeccodes-dev   -> required by cfgrib/eccodes for IMDAA GRIB2
+#   gdal-bin libgdal-dev         -> required by rasterio/fiona for DEM & LULC
+#   proj-bin libproj-dev         -> required by pyproj for LCC <-> WGS84
+#   libgeos-dev                  -> required by shapely for admin-boundary joins
+#   libhdf5-dev                  -> required by h5py for INSAT-3D/3DS products
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Numerical core
+#
+# numpy is held at 1.26.x deliberately: rasterio 1.3.x and the pinned cfgrib
+# build are compiled against the numpy 1.x ABI, and mixing them with numpy 2.x
+# produces import-time binary incompatibility rather than a clean error.
+# -----------------------------------------------------------------------------
+numpy==1.26.4
+scipy==1.14.1
+pandas==2.2.3
+
+# -----------------------------------------------------------------------------
+# Deep learning — Earthformer backbone, adapter bridge, DGMR generator/critics
+#
+# einops carries the cuboid partition/merge reshapes in the Earthformer
+# space-time attention blocks.
+# -----------------------------------------------------------------------------
+torch==2.5.1
+torchvision==0.20.1
+einops==0.8.0
+
+# -----------------------------------------------------------------------------
+# Meteorological I/O
+#
+#   h5py       INSAT-3D/3DS HDF5 (TIR-1 10.8um, WV 6.8um, CTT)
+#   cfgrib     IMDAA GRIB2 pressure-level fields, via the xarray engine
+#   eccodes    ECMWF bindings cfgrib delegates to; needs libeccodes from apt
+#   netCDF4    IMDAA NetCDF4 distributions and IMD gridded products
+#   dask       lazy/chunked reads over multi-file reanalysis archives
+# -----------------------------------------------------------------------------
+xarray==2024.7.0
+netCDF4==1.7.1.post2
+h5py==3.11.0
+h5netcdf==1.3.0
+cfgrib==0.9.14.1
+eccodes==1.7.1
+dask==2024.8.0
+zarr==2.18.3
+numcodecs==0.13.0
+
+# -----------------------------------------------------------------------------
+# Geospatial — reprojection, DEM/LULC/soil rasters, admin-boundary intersection
+#
+# Full GIS stack rather than a lightweight substitute: Lambert Conformal Conic
+# to WGS84 reprojection and district-level spatial joins over Indian
+# administrative boundaries both require correct PROJ and GEOS, not
+# approximations.
+# -----------------------------------------------------------------------------
+geopandas==1.0.1
+rasterio==1.3.11
+shapely==2.0.6
+pyproj==3.6.1
+fiona==1.10.1
+rioxarray==0.17.0
+
+# -----------------------------------------------------------------------------
+# Swath and scattered-point resampling
+#
+# pyresample is the PyTroll standard for satellite swath geometry, and it is
+# what handles the INSAT grid after parallax correction: once cloud tops are
+# shifted to their true ground positions the grid is no longer a regular sweep
+# but an irregular scatter, which rasterio's affine warp cannot express.
+#
+# scipy.griddata would triangulate 888^2 points per frame, thirteen frames per
+# window -- far too slow for an operational cadence. A hand-rolled KD-tree IDW
+# is fast but smears convective cores, which are precisely the features this
+# system exists to locate.
+#
+# pykdtree is pyresample's fast neighbour search backend and is pinned
+# explicitly so the resampling path cannot silently fall back to the slower
+# scipy tree.
+pyresample==1.28.2
+pykdtree==1.3.11
+configobj==5.0.8
+
+# -----------------------------------------------------------------------------
+# Quality control
+#
+# OpenCV supplies Farneback dense optical flow, used to reconstruct dropped
+# INSAT scan lines and missing single frames by advecting neighbouring
+# observations. Headless build: no GUI libraries are wanted in a container.
+# -----------------------------------------------------------------------------
+opencv-python-headless==4.10.0.84
+
+# -----------------------------------------------------------------------------
+# Explainable AI
+#
+#   captum   Integrated Gradients over Earthformer spatio-temporal tokens
+#
+# No SHAP. Gradient SHAP against a single climatological baseline is close to
+# the same estimator Integrated Gradients already runs, so it would cost a
+# second full attribution pass to produce a cross-check rather than
+# independent evidence. Driver ranking comes from the per-channel projections
+# in indra.xai.attribution.
+# -----------------------------------------------------------------------------
+captum==0.7.0
+
+# -----------------------------------------------------------------------------
+# RAG advisory — entirely local, no external API and no credential
+#
+# chromadb runs embedded with persistent storage; metadata filtering scopes
+# NDMA guideline retrieval by hazard class, severity tier and region.
+#
+# sentence-transformers embeds queries and documents with e5-small-v2 on the
+# CPU, so retrieval never contends for the VRAM the relay is holding. 384
+# dimensions, about 130 MiB.
+#
+# outlines constrains the advisory model's logits to the CAPAlertInfo JSON
+# schema during decoding, so the first sampled sequence is valid CAP content.
+# There is no parse-and-retry loop and no stripping of markdown fences,
+# because a token that would break the schema is never sampled.
+#
+# transformers is pinned explicitly rather than left to whichever of the two
+# above resolves it first: they would otherwise be free to disagree, and the
+# tokenizer is shared.
+# -----------------------------------------------------------------------------
+chromadb==0.5.5
+sentence-transformers==3.3.1
+outlines==0.1.11
+transformers==4.47.1
+accelerate==1.2.1
+
+# -----------------------------------------------------------------------------
+# API service layer
+# -----------------------------------------------------------------------------
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.0
+python-multipart==0.0.20
+websockets==14.1
+httpx==0.28.1
+
+# -----------------------------------------------------------------------------
+# Configuration and rendering
+#
+# PyYAML backs the plain-YAML config loader in configs/.
+# matplotlib renders XAI attribution heatmaps to raster for the API response.
+# -----------------------------------------------------------------------------
+PyYAML==6.0.2
+matplotlib==3.9.2
+Pillow==10.4.0
+tqdm==4.66.5

@@ -1,0 +1,139 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "indra"
+version = "1.0.0"
+description = "Hyper-localised Indian weather nowcasting with explainable AI"
+requires-python = ">=3.11"
+readme = "README.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# -----------------------------------------------------------------------------
+# pytest
+#
+# `pythonpath` means `pytest` works from a clean checkout without installing
+# the package or exporting PYTHONPATH.
+#
+# The suite deliberately covers only what runs without data: window
+# enumeration and the split rule, grid geometry and cell area, the
+# verification metrics, and the configuration validators. Anything needing a
+# granule, a checkpoint or a corpus is out of scope here rather than mocked --
+# a test against fabricated inputs would assert that the fabrication behaves
+# as expected, which is not a property of this system.
+# -----------------------------------------------------------------------------
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+
+# -----------------------------------------------------------------------------
+# ruff
+# -----------------------------------------------------------------------------
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+src = ["src", "scripts"]
+exclude = ["frontend"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "UP",       # pyupgrade
+    "B",        # bugbear
+    "SIM",      # simplify
+    "RUF",
+]
+ignore = [
+    "E501",    # line length: enforced by the formatter, not the linter
+    "B008",    # FastAPI's Depends() in a default is the framework's idiom
+    "RUF012",  # ClassVar annotations on mutable defaults, noisy on Pydantic
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Re-exported names in package docstring modules.
+"__init__.py" = ["F401"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["indra"]
+
+# -----------------------------------------------------------------------------
+# mypy
+#
+# Strict on our code, permissive about third-party stubs. The geospatial,
+# array and inference stack ships incomplete or absent type information --
+# rasterio, pyresample, cfgrib, chromadb, outlines and sentence-transformers
+# all lack stubs -- and without these overrides every import raises before a
+# single line of our own code is checked.
+#
+# The overrides below are grouped by *why* each library is exempt, because the
+# two reasons need different treatment. A library with no stubs at all only
+# needs ignore_missing_imports. A library that ships types mypy can see but
+# cannot use needs follow_imports too, otherwise the result depends on whether
+# that library happens to be installed -- which makes the check report
+# something different locally than it does in CI, and a gate that disagrees
+# with itself is not a gate.
+# -----------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+files = ["src/indra"]
+strict = true
+warn_unreachable = true
+show_error_codes = true
+# torch's own annotations are extensive but not strict-clean; failing on them
+# would make strict mode unusable rather than informative.
+disallow_any_generics = false
+warn_return_any = false
+# Our own functions must be annotated. Functions defined inside torch and
+# numpy need not be: Tensor.backward and the numpy.ma constructors carry no
+# return annotation upstream, and disallow_untyped_calls would otherwise
+# report our correct call sites as errors in someone else's code.
+untyped_calls_exclude = ["torch", "numpy"]
+
+# Group 1 -- no type information published at all.
+[[tool.mypy.overrides]]
+module = [
+    "affine.*",
+    "cfgrib.*",
+    "chromadb.*",
+    "captum.*",
+    "geopandas.*",
+    "h5py.*",
+    "matplotlib.*",
+    "PIL.*",
+    "rasterio.*",
+    "sentence_transformers.*",
+    "shapely.*",
+    "sklearn.*",
+    "transformers.*",
+    "xarray.*",
+]
+ignore_missing_imports = true
+
+# Group 2 -- types are published, and describe a narrower API than the library
+# actually accepts. Resolved to Any whether or not the package is installed.
+#
+#   cv2       stubs generated from the C++ overloads: they reject
+#             calcOpticalFlowFarneback(flow=None) and a scalar borderValue,
+#             both of which the Python bindings document and accept.
+#   outlines  0.1.x re-exports its public API without marking it, and its own
+#             MultinomialSampler does not satisfy the Sampler protocol it is
+#             declared against.
+#   pyresample  AreaDefinition, SwathDefinition and the resamplers are
+#             unannotated, so every geometry we build would be an untyped call.
+[[tool.mypy.overrides]]
+module = ["cv2.*", "outlines.*", "pyresample.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
+# no_implicit_reexport is a rule about the API *we* publish. torch does not
+# opt into it, so `torch.amp.GradScaler` -- the documented spelling since the
+# torch.cuda.amp deprecation -- reads as a private re-export without this.
+[[tool.mypy.overrides]]
+module = ["torch.*"]
+implicit_reexport = true
