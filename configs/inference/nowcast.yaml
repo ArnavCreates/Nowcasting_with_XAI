@@ -1,0 +1,280 @@
+# =============================================================================
+# Inference — live nowcast configuration
+#
+# Drives the FastAPI service: what is forecast, at what lead times, how
+# probabilities and severity are derived, and how the result is turned into an
+# XAI report and a CAP advisory for the frontend.
+# =============================================================================
+
+run:
+  # Default simulated nowcast epoch, drawn from the held-out 2020 season rather
+  # than the training years. A demonstration issued from data the model was
+  # fitted on proves only that it can memorise; 20 September 2020 sits in the
+  # erratic withdrawal phase of the validation year, so the default showcase
+  # exercises inter-annual generalisation instead.
+  default_valid_time: "2020-09-20T12:00:00Z"
+  # When false the service refuses timestamps outside the record rather than
+  # extrapolating a model that has never seen that season.
+  allow_out_of_record_time: false
+  record_start: "2017-06-01T00:00:00Z"
+  record_end: "2020-09-30T23:30:00Z"
+  # The record is four monsoon seasons, not one continuous span. Without this
+  # the window above would admit 15 December 2018 -- inside the start and end
+  # dates, and a date for which no observation of any kind exists.
+  record_months: [6, 7, 8, 9]
+
+model:
+  config: "configs/model/fusion.yaml"
+  checkpoint: "checkpoints/indra_fusion_v1.pt"
+  device: "cuda"
+  fallback_device: "cpu"
+  precision: "bf16"
+  eval_mode: true
+
+ensemble:
+  # Independent latent draws through the DGMR sampler. Every probability the
+  # API reports is a fraction of members crossing a threshold, not a squashed
+  # deterministic score.
+  members: 8
+  seed: 17
+  reductions: ["mean", "max", "std"]
+
+lead_times:
+  interval_minutes: 30
+  frames: 12
+  # +00:30 through +06:00. The 2-6 h actionable window the system targets is
+  # a subset of this, retained so the earlier frames provide continuity.
+  horizon_hours: 6
+  # Frames surfaced on the dashboard's hourly scrubber.
+  reported_hours: [1, 2, 3, 4, 5, 6]
+
+# -----------------------------------------------------------------------------
+# Threshold exceedance
+#
+# Intensity classes follow IMD rainfall terminology so the output is
+# interpretable to an Indian forecaster without a translation table.
+# -----------------------------------------------------------------------------
+thresholds:
+  precipitation_mm_h:
+    light: 2.5
+    moderate: 7.5
+    heavy: 15.0
+    very_heavy: 35.0
+    extremely_heavy: 60.0
+  # Probability = fraction of ensemble members exceeding the level at a cell.
+  probability_from_ensemble: true
+  # Below this, a cell is not reported as an exceedance at all. Suppresses the
+  # single-member speckle that would otherwise cover the map in 12% contours.
+  min_reported_probability: 0.15
+  # Severity tiers used by the advisory layer and the alert board.
+  severity_bands:
+    low:      {min_probability: 0.15, min_intensity_mm_h: 2.5}
+    moderate: {min_probability: 0.30, min_intensity_mm_h: 7.5}
+    high:     {min_probability: 0.50, min_intensity_mm_h: 15.0}
+    severe:   {min_probability: 0.70, min_intensity_mm_h: 35.0}
+
+# -----------------------------------------------------------------------------
+# XAI attribution
+# -----------------------------------------------------------------------------
+xai:
+  enabled: true
+  # Captum Integrated Gradients over the Earthformer spatio-temporal tokens.
+  integrated_gradients:
+    n_steps: 32
+    # Channel-wise climatological mean, i.e. "an ordinary monsoon day". An
+    # all-zeros baseline is meaningless in normalised space, where zero is a
+    # specific and quite ordinary atmospheric state rather than an absence.
+    baseline: "climatological_mean"
+    internal_batch_size: 4
+    # Attribute the exceedance probability, not raw rainfall: the question is
+    # what drove the warning.
+    target: "exceedance_probability"
+    # Fewer members than the served ensemble. Cost is n_steps x members relay
+    # evaluations, so at 32 steps each extra member is another 32 forward and
+    # backward passes through the whole relay; four keeps a live nowcast
+    # explainable without the explanation outlasting the forecast's usefulness.
+    members: 4
+    # Relaxation width of the exceedance surrogate, in mm h-1.
+    #
+    # A probability defined as a count of members over a threshold has zero
+    # gradient almost everywhere, so Integrated Gradients over it returns
+    # zeros while appearing to work. sigmoid((y - 15.0) / T) restores the
+    # gradient and tends to the count as T falls.
+    #
+    # At 1.0 the transition spans roughly the 12-18 mm/h band: smooth enough
+    # for the path integral to trace, sharp enough that moderate rain does not
+    # bleed into a heavy-rain attribution. This is a relaxation width, not a
+    # tuned constant, and every report records the value it used.
+    surrogate_temperature_mm_h: 1.0
+  # Driver ranking comes from the per-channel projections of the integrated
+  # gradients above, not from a separate SHAP pass. Gradient SHAP against a
+  # single climatological baseline is close to the same estimator, so it would
+  # buy a cross-check rather than independent evidence, at the cost of a
+  # second full attribution.
+  attribution_maps:
+    # Returned at model resolution and upsampled by the client, so the API
+    # never ships a 384x384 float array per channel.
+    output_resolution: 96
+    normalize: "per_sample_max"
+    colormap: "inferno"
+    top_k_drivers: 5
+  # Input frames ranked by attention mass, surfaced as the evidence the
+  # nowcast was based on.
+  evidence_frames:
+    enabled: true
+    top_k: 2
+    rank_by: "decoder_cross_attention"
+
+# -----------------------------------------------------------------------------
+# Geospatial post-processing
+# -----------------------------------------------------------------------------
+geospatial:
+  # Exceedance masks are intersected with administrative boundaries so an
+  # advisory names districts rather than raw coordinates.
+  admin_boundaries: "/data/static/india_admin_district.gpkg"
+  admin_layer: "districts"
+  admin_crs: "EPSG:4326"
+  join_predicate: "intersects"
+
+  # No area CRS. Cell areas are computed analytically from the spherical
+  # formula A = R^2 * dlon * (sin(lat_top) - sin(lat_bottom)), which is
+  # equal-area by construction and needs no projection at all. The previous
+  # EPSG:7755 was Lambert Conformal Conic -- conformal, not equal-area -- so
+  # it distorted the very quantity it was there to measure.
+
+  # A district qualifies if EITHER gate is met. Neither works alone.
+  #
+  # One grid cell is 9.27 km in latitude and 111.32*cos(lat)/12 km in
+  # longitude: 85 km2 at 8N, 81 km2 at 20N, 74 km2 at 30N. An absolute floor
+  # below that suppresses nothing, which is what the previous 25 km2 did --
+  # a single grazing pixel cleared it three times over.
+  #
+  # 150 km2 is roughly two cells, so an isolated pixel no longer raises a
+  # district-wide alert. But a floor alone can never flag a district smaller
+  # than itself however completely it is covered, so the fractional gate
+  # carries those: one cell is 13% of Mumbai City and 0.17% of Kutch.
+  min_affected_area_km2: 150.0
+  min_fractional_coverage: 0.05
+
+  dissolve_by: ["state", "district"]
+
+# -----------------------------------------------------------------------------
+# RAG advisory
+# -----------------------------------------------------------------------------
+advisory:
+  enabled: true
+  vector_store:
+    provider: "chromadb"
+    persist_directory: "vectorstore/ndma"
+    collection: "ndma_guidelines"
+    # Metadata filters scope retrieval to the situation at hand rather than
+    # returning generic guidance for every event.
+    metadata_filters: ["hazard_class", "severity_tier", "region"]
+    top_k: 5
+
+    # Embeddings run locally. Nothing in the advisory path calls out to a
+    # network service, so the collection can be built and queried offline and
+    # the system carries no API credential at all.
+    local_embedding:
+      model_id: "intfloat/e5-small-v2"
+      dimensions: 384
+      # e5 is trained asymmetrically and signals the two roles with a text
+      # prefix rather than an API task type. Documents are embedded as
+      # "passage: ..." and queries as "query: ...", and using one form for
+      # both measurably degrades retrieval.
+      document_prefix: "passage: "
+      query_prefix: "query: "
+      # CPU on purpose. The relay holds the GPU during a forecast, and a
+      # 130 MiB embedder has no business competing with it for VRAM.
+      device: "cpu"
+      normalize: true
+      batch_size: 32
+
+  # ---------------------------------------------------------------------------
+  # Advisory model
+  #
+  # In-process, under guided decoding. outlines constrains the model's logits
+  # to the CAPAlertInfo JSON schema during sampling, so the first sequence is
+  # valid CAP content: there is no parse-and-retry loop and no stripping of
+  # markdown fences, because a token that would break the schema is never
+  # available to sample.
+  #
+  # Note the residency cost. Loaded on "cuda" this model sits in VRAM
+  # alongside the Earthformer and the DGMR sampler for the life of the
+  # process, not only while composing. On a single accelerator that is the
+  # first thing to move to "cpu" if the relay runs short of memory.
+  # ---------------------------------------------------------------------------
+  local_advisory:
+    model_id_or_path: "models/advisory/Qwen2.5-1.5B-Instruct"
+    device: "cuda"
+    fallback_device: "cpu"
+    context_window: 4096
+    # Room for the forecast summary and five NDMA excerpts alongside the
+    # generation; config.py refuses a value that would not leave any.
+    max_tokens: 1024
+    # Low, not zero. The schema is already guaranteed by decoding, so this
+    # governs only wording -- and at exactly zero a model that begins a
+    # sentence badly has no way out of it.
+    temperature: 0.1
+  cap:
+    # OASIS Common Alerting Protocol 1.2.
+    version: "1.2"
+    status: "Actual"
+    msg_type: "Alert"
+    scope: "Public"
+    sender: "indra-nowcast"
+    language: "en-IN"
+    categories: ["Met"]
+    urgency_by_lead_hours:
+      immediate: 2      # impact within 2 h
+      expected: 6       # impact within 6 h
+    # The LLM composes only from retrieved NDMA chunks; it does not introduce
+    # instructions of its own.
+    constrain_to_retrieved: true
+    require_citations: true
+
+  # ---------------------------------------------------------------------------
+  # Hazard taxonomy
+  #
+  # A PROXY standing in for NDMA's own classification, not a transcription of
+  # it. These thresholds scope which guidelines are retrieved -- landslide
+  # protocols must not reach a flat coastal district -- and they are declared
+  # here so that swapping in the authoritative table is a configuration change
+  # and so a reader can see the criteria instead of inferring them from code.
+  #
+  # Elevation is compared in metres, against the district mean of
+  # dem_elevation denormalised out of the tensor's min-max scaling.
+  # ---------------------------------------------------------------------------
+  taxonomy:
+    mountainous_elevation_m: 500.0
+    coastal_elevation_m: 20.0
+    urban_fraction: 0.30
+    # Class indices counting as urban, from the Bhuvan codebook the deployed
+    # LULC raster was built against. The indices differ between Bhuvan
+    # releases, so this is set per deployment rather than hardcoded: a wrong
+    # index classifies the wrong districts silently. Left empty, urban
+    # classification is unavailable and every district takes the default
+    # hazard class, which the retrieval context records as an absent
+    # determination rather than a positive one.
+    urban_lulc_classes: []
+
+# -----------------------------------------------------------------------------
+# API service
+# -----------------------------------------------------------------------------
+api:
+  host: "0.0.0.0"
+  port: 8000
+  root_path: ""
+  # The vendored frontend dev server and its containerised origin.
+  cors_allow_origins:
+    - "http://localhost:5173"
+    - "http://frontend:5173"
+  cors_allow_credentials: false
+  request_timeout_seconds: 120
+  # Nowcast fields are deterministic for a given valid time and seed, so
+  # repeated requests for the same epoch are served from cache.
+  cache:
+    enabled: true
+    backend: "in_memory"
+    ttl_seconds: 900
+    max_entries: 64

@@ -1,0 +1,202 @@
+# =============================================================================
+# Stage 3 — The Fusion Relay
+#
+#   3A  Earthformer backbone      space-time cuboid attention over the 5D input
+#   3B  Adapter bridge            latent reshaping to DGMR conditioning format
+#   3C  DGMR generative refinement probabilistic high-resolution precipitation
+#
+# Architectural references:
+#   Gao et al., "Earthformer: Exploring Space-Time Transformers for Earth
+#   System Forecasting", NeurIPS 2022 (amazon-science/earth-forecasting-transformer)
+#   Ravuri et al., "Skilful precipitation nowcasting using deep generative
+#   models of radar", Nature 2021 (openclimatefix/skillful_nowcasting)
+# =============================================================================
+
+input:
+  # Must match configs/data/preprocessing.yaml exactly. A mismatch here is not
+  # caught by a shape error -- the tensor is the right size but the channels
+  # mean different things.
+  sequence_length: 13
+  channels: 30
+  height: 384
+  width: 384
+
+output:
+  # Precipitation nowcast at 30-minute cadence out to +6 h.
+  lead_frames: 12
+  lead_interval_minutes: 30
+  horizon_hours: 6
+  channels: 1
+  units: "mm h-1"
+
+# -----------------------------------------------------------------------------
+# 3A. Earthformer backbone
+# -----------------------------------------------------------------------------
+earthformer:
+  # Conv stem downsamples 384 -> 96 before any attention. Attending at full
+  # resolution over 13 frames is quadratic in 384*384*13 tokens and is not
+  # tractable; the cuboid decomposition assumes an already-reduced grid.
+  patch_embed:
+    patch_size: 4
+    embed_dim: 128
+    norm: "layer_norm"
+
+  base_units: 128
+  num_heads: 8
+  ffn_expansion: 4
+  attn_dropout: 0.1
+  proj_dropout: 0.1
+  ffn_dropout: 0.1
+  activation: "gelu"
+
+  # Hierarchical encoder: two stages, halving spatially and doubling width.
+  encoder:
+    depths: [2, 2]
+    downsample_factors: [1, 2]
+    dims: [128, 256]
+
+  decoder:
+    depths: [2, 2]
+    upsample_factors: [2, 1]
+    dims: [256, 128]
+    # Cross-attention from learned output queries to the encoder memory, so
+    # every lead time reads the whole input history directly instead of
+    # inheriting it through an autoregressive chain that accumulates drift.
+    cross_attention: true
+    cross_attn_heads: 8
+
+  # Cuboid attention pattern, applied in sequence within each stage.
+  #
+  # Each entry is [cuboid_size(T,H,W), strategy, shift].
+  #   local   contiguous blocks: neighbours attend to neighbours
+  #   dilated strided elements: one block already spans the whole domain
+  #
+  # Alternating the two is the mechanism by which a shallow stack reaches a
+  # near-global receptive field without dense space-time attention.
+  cuboid_blocks:
+    - size: [2, 4, 4]
+      strategy: "local"
+      shift: [0, 0, 0]
+    - size: [2, 4, 4]
+      strategy: "dilated"
+      shift: [0, 0, 0]
+    - size: [13, 1, 1]
+      strategy: "local"
+      shift: [0, 0, 0]
+
+  # Global vectors carry information between cuboids that never attend to one
+  # another directly. Without them the local strategy is purely myopic.
+  global_vectors:
+    enabled: true
+    num_vectors: 8
+    update_rule: "attend_over_cuboid_means"
+
+  positional_encoding:
+    type: "learned"
+    separate_temporal_spatial: true
+
+  # Relative position bias within each cuboid, per head.
+  relative_position_bias: true
+
+  checkpoint:
+    # Official Earthformer base weights, then fine-tuned on the Indian
+    # South-West Monsoon record. The fine-tuning years are JJAS 2017-2019
+    # only: JJAS 2020 is the held-out validation season and never reaches the
+    # optimiser, so the filename records the training span rather than the
+    # dataset span. Nothing in this repository downloads or produces this
+    # file; it is supplied by the deployment and mounted read-only.
+    load_pretrained: true
+    path: "checkpoints/earthformer_india_monsoon_17_19.pt"
+    strict: false
+    # Stem and head are re-initialised: the published backbone was trained on
+    # a different channel count, so those two layers cannot transfer.
+    reinit_modules: ["patch_embed", "output_head"]
+
+# -----------------------------------------------------------------------------
+# 3B. Spatio-temporal adapter bridge
+#
+# Earthformer emits a per-lead-time latent; DGMR's sampler expects a spatial
+# conditioning stack at several resolutions. The adapter is what reconciles
+# those two representations -- without it the two models cannot be composed at
+# all, regardless of how each performs alone.
+# -----------------------------------------------------------------------------
+adapter:
+  in_dim: 128
+  # Fold the temporal axis into channels so the generative head sees a single
+  # conditioning tensor per lead time rather than a sequence.
+  temporal_to_channel: true
+  in_sequence: 12
+  # Pyramid of conditioning resolutions consumed by the DGMR sampler.
+  output_scales: [96, 48, 24, 12]
+  output_dims: [96, 192, 384, 768]
+  norm: "group_norm"
+  groups: 8
+  activation: "relu"
+  # Spatial alignment back to the DGMR working resolution.
+  interpolation: "bilinear"
+  align_corners: false
+  residual_projection: true
+
+# -----------------------------------------------------------------------------
+# 3C. DGMR generative refinement
+#
+# A deterministic backbone trained on L1/L2 regresses to the conditional mean,
+# which for precipitation means blurred blobs that lose exactly the sharp
+# convective cores a cloudburst warning depends on. The generator restores
+# them; the latent noise input is what makes an ensemble possible.
+# -----------------------------------------------------------------------------
+dgmr:
+  generator:
+    conditioning_dims: [96, 192, 384, 768]
+    latent_channels: 768
+    num_upsample_blocks: 4
+    output_channels: 1
+    forecast_steps: 12
+    # ConvGRU carries state across lead times so consecutive frames are
+    # temporally coherent instead of flickering independently.
+    convgru_kernel: 3
+    spectral_norm: true
+
+  latent_conditioning_stack:
+    noise_channels: 8
+    latent_resolution: 12
+    output_channels: 768
+    # Draws per forward pass at inference. The spread across draws is what the
+    # probability fields are computed from.
+    ensemble_members: 8
+
+  discriminators:
+    spatial:
+      enabled: true
+      base_channels: 48
+      num_layers: 4
+      # Frames are randomly subsampled in time, per the paper, to bound cost.
+      num_sampled_frames: 8
+      spectral_norm: true
+    temporal:
+      enabled: true
+      base_channels: 48
+      num_layers: 4
+      # 3D stem over the time axis, so the critic judges motion and
+      # growth/decay rather than per-frame texture.
+      stem_kernel: [4, 3, 3]
+      stem_stride: [2, 1, 1]
+      spectral_norm: true
+
+  checkpoint:
+    # Fine-tuned on JJAS 2017-2019, as above; 2020 is held out.
+    load_pretrained: true
+    path: "checkpoints/dgmr_india_monsoon_17_19.pt"
+    strict: false
+    reinit_modules: ["latent_conditioning_stack"]
+
+# -----------------------------------------------------------------------------
+# Assembled model
+# -----------------------------------------------------------------------------
+fusion:
+  name: "indra_fusion_v1"
+  freeze_backbone: false
+  # Ordering of the composed forward pass, for reference by the assembler.
+  relay: ["earthformer", "adapter", "dgmr"]
+  precision: "bf16"
+  gradient_checkpointing: true

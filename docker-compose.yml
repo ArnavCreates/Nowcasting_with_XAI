@@ -1,0 +1,101 @@
+# =============================================================================
+# Indra — development stack
+#
+#   cp .env.example .env
+#   docker compose up
+#
+# Two services, deliberately split for development:
+#
+#   backend   FastAPI under uvicorn --reload, with src/ and configs/
+#             bind-mounted so an edit restarts the worker in place.
+#   frontend  The vendored Vite dev server, with its own HMR.
+#
+# For a single-container deployment the frontend is built into the image
+# instead and served from the same origin -- see Dockerfile. This file is the
+# development shape, which is why CORS matters here and not there.
+# =============================================================================
+
+services:
+  backend:
+    build:
+      context: .
+      target: runtime
+      args:
+        # CPU wheels by default. See .env.example for the GPU index.
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+    ports:
+      - "${INDRA_BACKEND_PORT:-8000}:8000"
+    volumes:
+      # Source and configuration, read-write for --reload to notice changes.
+      - ./src:/app/src
+      - ./configs:/app/configs
+
+      # External artefacts. Every one is absent from a fresh clone; the
+      # service starts anyway and reports each on /healthz, so they can be
+      # supplied one at a time.
+      #
+      # Read-only where the service only consumes: a bug that truncated a
+      # 3 GB checkpoint or a curated NDMA corpus would be expensive, and
+      # nothing here has any reason to write to them.
+      - ${INDRA_CHECKPOINTS_DIR:-./checkpoints}:/app/checkpoints:ro
+      - ${INDRA_MODELS_DIR:-./models}:/app/models:ro
+      - ${INDRA_VECTORSTORE_DIR:-./vectorstore}:/app/vectorstore
+      - ${INDRA_DATA_DIR:-./data}:/app/data
+      - ${INDRA_REPLAY_DIR:-./replay_buffer}:/app/replay_buffer
+    environment:
+      # Unbuffered, so uvicorn's startup log and the component readiness lines
+      # appear as they happen rather than when the buffer fills.
+      PYTHONUNBUFFERED: "1"
+    command:
+      - uvicorn
+      - indra.api.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --reload
+      - --reload-dir
+      - /app/src
+    healthcheck:
+      # /healthz answers while degraded, so this reports the container up as
+      # soon as it can serve -- not only once weights are mounted.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+    networks: [indra]
+
+  frontend:
+    # The vendored source, run by the stock Node image. No Dockerfile of its
+    # own: frontend/ is vendored unmodified and building an image for a dev
+    # server would mean rebuilding it on every dependency change.
+    image: node:20-slim
+    working_dir: /app
+    ports:
+      - "${INDRA_FRONTEND_PORT:-5173}:5173"
+    volumes:
+      - ./frontend:/app
+      # Anonymous volume so the container's node_modules is not shadowed by
+      # the host directory, which does not have one. Without this the bind
+      # mount hides the install and every import fails.
+      - /app/node_modules
+    environment:
+      # Read in the browser, not in the container, so these must be reachable
+      # from the host. http://backend:8000 resolves only inside this network
+      # and means nothing to a browser -- a mistake that produces a CORS-shaped
+      # error whose real cause is DNS.
+      VITE_ALERTING_API_URL: ${VITE_ALERTING_API_URL:-http://localhost:8000}
+      VITE_ML_MODEL_API_URL: ${VITE_ML_MODEL_API_URL:-http://localhost:8000}
+      VITE_USE_REAL_ALERTS: ${VITE_USE_REAL_ALERTS:-false}
+      VITE_USE_REAL_MODEL: ${VITE_USE_REAL_MODEL:-false}
+    # --host binds 0.0.0.0. Vite listens on localhost by default, which inside
+    # a container is reachable only from the container.
+    command: sh -c "npm install --no-audit --no-fund && npm run dev -- --host 0.0.0.0 --port 5173"
+    depends_on:
+      - backend
+    networks: [indra]
+
+networks:
+  indra:
+    driver: bridge

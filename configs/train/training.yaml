@@ -1,0 +1,297 @@
+# =============================================================================
+# Stage 4 — Training
+#
+# The adversarial loop that fits the fusion relay: an Earthformer backbone and
+# adapter bridge feeding a DGMR sampler judged by two critics, with a streaming
+# experience replay buffer holding the extreme convective events a
+# chronological stream would otherwise forget.
+#
+# Consumed by src/indra/training/. Loss weights map onto
+# training.losses.LossWeights and the replay policy onto
+# training.replay_buffer.RetentionPolicy, field for field.
+#
+# Reference:
+#   Ravuri et al., "Skilful precipitation nowcasting using deep generative
+#   models of radar", Nature 2021 (openclimatefix/skillful_nowcasting)
+# =============================================================================
+
+run:
+  name: "indra_fusion_v1"
+  seed: 17
+  # cuDNN determinism. Costs throughput on some convolutions and is worth it:
+  # an adversarial run that cannot be reproduced cannot be debugged, because
+  # every divergence looks like it might be the seed.
+  deterministic: true
+  device: "cuda"
+  fallback_device: "cpu"
+  # Must equal model.fusion.precision. Training the relay in bf16 and serving
+  # it in fp32 would change the numerics of a checkpoint between the run that
+  # produced it and the service that loads it.
+  precision: "bf16"
+  gradient_checkpointing: true
+
+# -----------------------------------------------------------------------------
+# Data and the chronological split
+# -----------------------------------------------------------------------------
+data:
+  # Four monsoon seasons, expressed as seasons rather than one span. A single
+  # start/end would claim October-May three times over, where there is no
+  # monsoon and no record, and the sampler would spend its time discovering
+  # that by failing to read.
+  seasons:
+    years: [2017, 2018, 2019, 2020]
+    months: [6, 7, 8, 9]
+
+  split:
+    # Chronological, never random. A random split puts 30-minute neighbours of
+    # a training window into validation; consecutive frames of one storm are
+    # near-identical, so the model would be scored on data it has effectively
+    # seen and the reported skill would be meaningless.
+    strategy: "chronological"
+    train_until: "2019-09-30T23:59:59Z"
+    validation_from: "2020-06-01T00:00:00Z"
+    # A sample spans 6 h of lookback and 6 h of target. Windows must lie wholly
+    # inside one season: a window opening on 1 June needs twelve antecedent
+    # frames from late May, which do not exist, and one closing on 30 September
+    # needs targets from October, which also do not.
+    require_window_within_season: true
+
+  batch_size: 1
+  num_workers: 4
+  prefetch_factor: 2
+  pin_memory: true
+  shuffle_train: true
+  drop_last: true
+
+# -----------------------------------------------------------------------------
+# Window cache
+#
+# Rebuilding one sample reads thirteen INSAT granules, the IMDAA and IMD
+# surface streams, then twelve HEM granules plus twelve more INSAT granules for
+# the cloud-top temperatures the target's parallax correction needs. This makes
+# that payable once.
+#
+# The directory is keyed internally by a hash of the ingestion and
+# preprocessing configuration, so changing the domain, grid, channel list or a
+# QC threshold lands on a different path and stale entries are never served.
+# -----------------------------------------------------------------------------
+cache:
+  # Under /data/, which .gitignore already excludes: these are derived
+  # artefacts, reproducible from the archive and never tracked.
+  dir: "data/cache/windows"
+
+  # none | target_only | both
+  #
+  # An input stack is 13 x 30 x 384 x 384 float32 = 219 MiB; a target stack is
+  # 6.75 MiB. Across the ~23,300 windows of this record, "both" is 5.15 TiB and
+  # the training split alone is 3.9 TiB. A size cap would not help: shuffled
+  # access touches every window once per epoch, so a partial cache thrashes
+  # rather than degrading, each lookup evicting an entry wanted later in the
+  # same epoch.
+  #
+  # "target_only" is 3% of the bytes and carries most of the work -- the twelve
+  # extra CTT reads, twelve parallax corrections and twelve swath resamplings
+  # the input path does not have -- at roughly 164 GiB, which fits on a scratch
+  # volume. Raise to "both" only where the disk genuinely exists.
+  scope: "target_only"
+
+# -----------------------------------------------------------------------------
+# Generator
+# -----------------------------------------------------------------------------
+generator:
+  # N in E_Z[G(z)] for the grid-cell regulariser. This is the tightest memory
+  # constraint in the run: R differentiates through the ensemble mean, so all
+  # N generator graphs are retained for the backward pass and activation
+  # memory scales with N x batch_size rather than batch_size. Raising it
+  # sharpens the estimate of the mean and multiplies VRAM by the same factor.
+  samples_per_step: 6
+
+  optimizer:
+    type: "adam"
+    # An order of magnitude below the critics'. The generator is the harder
+    # optimisation and moving it faster than its judges is how the pair
+    # oscillates instead of converging.
+    lr: 5.0e-5
+    # beta1 = 0.0 rather than the usual 0.9. Momentum through a non-stationary
+    # adversarial objective carries stale gradients from a critic that has
+    # since changed its mind.
+    betas: [0.0, 0.999]
+    eps: 1.0e-8
+
+  # Discriminative fine-tuning: the Earthformer gets its own parameter group at
+  # this fraction of the rate above, so 5.0e-6 here.
+  #
+  # The backbone arrives pretrained; the adapter and the sampler arrive random.
+  # At a shared rate, the first few hundred steps push full-magnitude gradients
+  # from a bridge that is still noise into representations that took a long
+  # time to learn, and the pretrained features are gone before they were ever
+  # useful. This, together with schedule.backbone_unfreeze_step, is what keeps
+  # fine-tuning from destroying what it is fine-tuning.
+  backbone_lr_multiplier: 0.1
+
+# -----------------------------------------------------------------------------
+# Discriminators
+# -----------------------------------------------------------------------------
+discriminator:
+  optimizer:
+    type: "adam"
+    lr: 2.0e-4
+    betas: [0.0, 0.999]
+    eps: 1.0e-8
+  # Two critic steps per generator step, per the paper. A critic that lags its
+  # generator stops discriminating and its gradient stops carrying information
+  # about what is wrong with the sample.
+  steps_per_generator_step: 2
+
+# -----------------------------------------------------------------------------
+# Loss weights  ->  training.losses.LossWeights
+#
+# All terms are computed in mm h-1, not normalised units. lambda = 20 was tuned
+# against rain-rate magnitudes, and w(y) = clip(y, 0, 24) on a normalised field
+# would assign zero weight to every cell below the climatological mean.
+# -----------------------------------------------------------------------------
+losses:
+  adversarial_spatial: 1.0
+  adversarial_temporal: 1.0
+  # lambda in the paper's generator objective. Dominates early training on
+  # purpose, handing the critics a roughly-positioned field to sharpen rather
+  # than asking them to solve placement and texture at once.
+  grid_cell: 20.0
+  # Weight on the Earthformer's deterministic head. A neutral starting value,
+  # not a tuned one.
+  auxiliary: 1.0
+  grid_cell_max_weight: 24.0
+
+# -----------------------------------------------------------------------------
+# Schedule
+# -----------------------------------------------------------------------------
+schedule:
+  max_steps: 500000
+  warmup_steps: 1000
+  # Constant, per the paper. A decaying rate on the generator while the critics
+  # keep learning hands the adversarial game to the critics late in training.
+  lr_schedule: "constant"
+  # Null: spectral normalisation already bounds the critics' Lipschitz
+  # constant, and clipping on top of it would mask a genuinely exploding
+  # generator rather than reveal it.
+  grad_clip_norm: null
+  # Null hands the decision to model.fusion.freeze_backbone for the whole run.
+  # A number means the trainer owns it instead: the Earthformer is frozen from
+  # step 0 and released at this step, which is the only reading under which
+  # this field does anything a static flag could not.
+  #
+  # Set to the warmup length on purpose. The adapter and the ConvGRU stack
+  # spend those steps learning a conditioning map from random initialisation,
+  # and the gradients they send backwards during that period describe their own
+  # confusion rather than anything about the backbone. The backbone joins once
+  # what reaches it is meaningful, and then at a tenth of the rate.
+  backbone_unfreeze_step: 1000
+
+# -----------------------------------------------------------------------------
+# Experience replay  ->  training.replay_buffer.RetentionPolicy
+#
+# Heavy rain is rare, so a chronological stream drifts toward the
+# climatological mean between storms and forgets the right tail -- the only
+# part of the distribution a cloudburst warning is about.
+# -----------------------------------------------------------------------------
+replay:
+  enabled: true
+  capacity: 512
+  # Under /replay_buffer/, which .gitignore anchors. The manifest holds
+  # valid_time references and metrics only, never tensors: one input window is
+  # 13 x 30 x 384 x 384 float32 = 219 MiB, so a full buffer of arrays would be
+  # roughly 113 GiB.
+  manifest: "replay_buffer/buffer.jsonl"
+  # Distinct from run.seed so the admission lottery is reproducible
+  # independently of weight initialisation.
+  seed: 23
+  samples_per_batch: 1
+  # The buffer must never see a validation window. Without this, 2020 events
+  # are archived and replayed into training, and the held-out season stops
+  # being held out through a side door.
+  admission_only_from_training_split: true
+
+  policy:
+    # The last four frames, t-3 through t0. The Earthformer attends across all
+    # thirteen, but the DGMR ConvGRU hidden states are initialised from
+    # conditioning built on the immediate antecedent state, so a gap-filled
+    # frame at t0 compromises the whole generative trajectory while one at t-12
+    # is survivable.
+    gate_frames: 4
+    # IMDAA is excluded: it is a reanalysis product, so "observed" does not
+    # mean the same thing. Static priors have no time axis at all.
+    required_streams: ["insat", "imd_surface"]
+    # Separate from the is_observed test, and the distinction is the point. A
+    # saturated detector or a duplicated scan line produces a frame that is
+    # genuinely observed and simultaneously worthless: is_observed passes it,
+    # the intensity score loves it, and the buffer would fill with instrument
+    # failures ranked as record rainfall.
+    disqualifying_flags: ["SATURATED", "SCANLINE_DROPOUT",
+                          "CALIBRATION_FAILED", "PARTIAL_COVERAGE"]
+    min_valid_fraction: 0.85
+    # An event whose target is half-missing is mostly masked out of the loss,
+    # so replaying it teaches almost nothing while costing a full rehydration.
+    min_target_valid_fraction: 0.85
+    precip_channel: "imd_precip"
+    # Gated separately because the score is derived from this channel: a window
+    # can look healthy overall while precipitation specifically is half absent.
+    min_precip_coverage: 0.85
+
+    # IMD "heavy rainfall". Matches inference thresholds.precipitation_mm_h.
+    heavy_threshold_mm_h: 15.0
+    admission_quantile: 0.90
+    # Absolute floor used before enough scores exist to estimate a quantile.
+    # The 90th percentile of the first ten windows is a drizzle day. A
+    # conservative default, not a climatological statistic.
+    min_exceedance_area: 0.001
+    score_history_size: 4096
+    min_history: 256
+    # Windows closer than this are treated as one event. Without it a
+    # slow-moving monsoon depression contributes a window every thirty minutes
+    # for a day and monopolises the reservoir.
+    min_separation_minutes: 180
+
+# -----------------------------------------------------------------------------
+# Validation — the whole of JJAS 2020, never seen in training
+# -----------------------------------------------------------------------------
+validation:
+  every_steps: 5000
+  max_batches: 200
+  ensemble_members: 8
+  # Fixed, and distinct from the training seed: validation must measure the
+  # model changing, not the noise draw changing.
+  seed: 17
+  # Verification consults QCFlag.is_observed, never is_usable. Scoring against
+  # a gap-filled frame means scoring our own optical-flow interpolation and
+  # calling it skill.
+  require_observed_targets: true
+  metrics: ["csi", "pod", "far", "crps", "mae_mm_h"]
+
+# -----------------------------------------------------------------------------
+# Checkpointing
+# -----------------------------------------------------------------------------
+checkpointing:
+  dir: "checkpoints"
+  every_steps: 5000
+  keep_last: 3
+  # Optimiser state included: resuming an adversarial run without the Adam
+  # moments restarts both players from a standstill against opponents that are
+  # not, and the pair takes thousands of steps to re-equilibrate.
+  save_optimizer_state: true
+  # Selection is on skill at the heavy threshold, not on total loss. A run can
+  # improve its aggregate loss by getting better at drizzle while getting worse
+  # at exactly the events the system exists to warn about.
+  monitor: "csi_heavy"
+  mode: "max"
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logging:
+  every_steps: 50
+  # Every LossBreakdown term separately, not just the total. Collapsed critics,
+  # swamping regularisation and a stalled generator are three different
+  # failures with three different fixes, and one scalar distinguishes none of
+  # them.
+  log_loss_components: true
+  replay_stats_every_steps: 1000

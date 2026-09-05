@@ -1,0 +1,392 @@
+# =============================================================================
+# Stage 1 — Multi-source ingestion and spatio-temporal synchronisation
+#
+# Declares WHERE each stream lives, WHAT is read from it, and HOW asynchronous
+# observations are aligned onto a common 30-minute grid.
+#
+# No paths below are resolved by this repository. They describe a production
+# deployment in which the archives are mounted read-only into the container
+# (see docker/docker-compose.yml). Nothing here triggers a download.
+# =============================================================================
+
+domain:
+  name: india_monsoon_core
+  # Resolved geometry: 384 x 384 at exactly 1/12 degree = a 32.0 x 32.0 window
+  # anchored at the south-west corner. Square pixels are a hard requirement --
+  # anisotropic cells break the isotropy assumed by the optical-flow gap filler
+  # and by the convolutional stacks downstream.
+  crs: "EPSG:4326"
+  lat_min: 6.0
+  lat_max: 38.0
+  lon_min: 68.0
+  lon_max: 100.0
+  grid_height: 384
+  grid_width: 384
+  resolution_deg: 0.0833333333333333   # 1/12 degree, ~9.25 km at the equator
+
+temporal:
+  # T = 13 frames at a 30-minute cadence. Indices run t-12 .. t0 inclusive, so
+  # the observed span from the oldest frame to nowcast time is 360 minutes.
+  interval_minutes: 30
+  sequence_length: 13
+  lookback_indices: [-12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0]
+  # Forecast offsets, t+1 .. t+12, i.e. +00:30 through +06:00. Declared here
+  # beside the lookback so the ingestion layer states both halves of a training
+  # sample in one place; cross-checked against model.output.lead_frames.
+  #
+  # These index the target stream only. t0 belongs to the history, never to the
+  # forecast, which is why the leads start at 1 and there are twelve of them
+  # against the lookback's thirteen.
+  lead_indices: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+  # Observations are accepted into a slot only if they fall within this
+  # tolerance of the nominal timestamp. Geostationary scan start times drift by
+  # a minute or two; anything beyond this is a different scan, not jitter.
+  alignment_tolerance_minutes: 7
+  timezone: "UTC"
+
+# -----------------------------------------------------------------------------
+# A. Satellite remote sensing — INSAT-3D / 3DS (IMD / MOSDAC), HDF5
+# -----------------------------------------------------------------------------
+sources:
+  insat:
+    enabled: true
+    format: hdf5
+    root: "/data/raw/insat3d"
+    # Native imagery dimensions of the MOSDAC subset ordered for this domain.
+    # 888 cells across the 32-degree window is 0.036036 deg = 4.01 km, the
+    # nominal TIR/WV footprint of the INSAT-3D imager.
+    #
+    # Declared rather than discovered because it must be deterministic: when
+    # the first frame of a lookback window is the corrupt one, there is no
+    # earlier granule to infer the shape from, and a reader that cannot state
+    # the shape of a missing frame cannot mask it either.
+    native_shape: [888, 888]
+    # MOSDAC standard L1C/L2B naming, e.g.
+    #   3DIMG_23SEP2017_0600_L1C_ASIA_MER.h5
+    filename_pattern: "3DIMG_{day:02d}{month_abbr}{year}_{hour:02d}{minute:02d}_*.h5"
+    # HDF5 dataset paths inside each granule. Group layout follows the MOSDAC
+    # L1C product specification.
+    datasets:
+      insat_tir1:
+        path: "/IMG_TIR1"
+        description: "Thermal Infrared 1, 10.8 um brightness temperature"
+        units: "K"
+        # L1C products store scaled counts; the calibration LUT converts them
+        # to radiance and then to brightness temperature.
+        calibration_lut: "/IMG_TIR1_TEMP"
+        valid_range: [180.0, 340.0]
+        fill_value: 1023
+      insat_wv:
+        path: "/IMG_WV"
+        description: "Water Vapour, 6.8 um brightness temperature"
+        units: "K"
+        calibration_lut: "/IMG_WV_TEMP"
+        valid_range: [180.0, 300.0]
+        fill_value: 1023
+      insat_ctt:
+        path: "/CTT"
+        description: "Cloud Top Temperature, L2B derived product"
+        units: "K"
+        calibration_lut: null
+        valid_range: [180.0, 320.0]
+        fill_value: -999.0
+    geolocation:
+      latitude_dataset: "/Latitude"
+      longitude_dataset: "/Longitude"
+      # Nominal sub-satellite longitude for INSAT-3D. Required by the parallax
+      # correction: an off-nadir cloud top is displaced away from the sub-point
+      # by an amount that grows with both viewing angle and cloud height.
+      subsatellite_lon: 82.0
+      satellite_altitude_km: 35786.0
+
+  # ---------------------------------------------------------------------------
+  # B. NWP reanalysis — IMDAA / NCUM, GRIB2 or NetCDF4
+  # ---------------------------------------------------------------------------
+  imdaa:
+    enabled: true
+    format: grib2            # xarray + cfgrib engine; netcdf4 also accepted
+    root: "/data/raw/imdaa"
+    # 296 cells across the same 32-degree window is 0.108108 deg = 12.03 km,
+    # the nominal NCUM/IMDAA reanalysis grid spacing. Upsampled by 1.30x onto
+    # the 384 x 384 target grid during reprojection.
+    native_shape: [296, 296]
+    filename_pattern: "IMDAA_{variable}_{level}_{year}{month:02d}.grb2"
+    engine: "cfgrib"
+    # cfgrib needs to be told which GRIB message subset to expose, otherwise a
+    # multi-typeOfLevel file raises on open rather than selecting.
+    backend_kwargs:
+      filter_by_keys:
+        typeOfLevel: "isobaricInhPa"
+      indexpath: ""          # disable .idx sidecars on a read-only mount
+    pressure_levels_hpa: [200, 500, 700, 850]
+    variables:
+      u: {short_name: "u",  description: "Zonal wind component",       units: "m s-1"}
+      v: {short_name: "v",  description: "Meridional wind component",  units: "m s-1"}
+      t: {short_name: "t",  description: "Air temperature",            units: "K"}
+      rh: {short_name: "r", description: "Relative humidity",          units: "%"}
+      z: {short_name: "gh", description: "Geopotential height",        units: "gpm"}
+    # IMDAA is hourly; the 30-minute grid is filled by temporal interpolation
+    # in preprocessing rather than by repeating the hourly value.
+    native_interval_minutes: 60
+    native_crs: "EPSG:4326"
+
+  # ---------------------------------------------------------------------------
+  # C. Surface observations — IMD gauge and AWS gridded products
+  # ---------------------------------------------------------------------------
+  imd_surface:
+    enabled: true
+    root: "/data/raw/imd"
+    variables:
+      imd_precip:
+        format: binary_grd
+        filename_pattern: "Rainfall_ind{year}_rfp25.grd"
+        description: "Gridded gauge-interpolated rainfall"
+        units: "mm"
+        # Official IMD 0.25 degree rainfall grid. These extents are a property
+        # of the product, not of our domain, and must not be conflated with it.
+        native_grid:
+          lat_min: 6.5
+          lat_max: 38.5
+          lon_min: 66.5
+          lon_max: 100.0
+          n_lat: 129
+          n_lon: 135
+          resolution_deg: 0.25
+          dtype: "float32"
+          fill_value: -999.0
+        native_interval_minutes: 1440   # daily
+      temp_2m:
+        format: netcdf4
+        filename_pattern: "IMD_T2M_{year}.nc"
+        variable: "t2m"
+        units: "K"
+        native_interval_minutes: 180
+      rh_2m:
+        format: netcdf4
+        filename_pattern: "IMD_RH2M_{year}.nc"
+        variable: "rh2m"
+        units: "%"
+        native_interval_minutes: 180
+      wind_10m:
+        format: netcdf4
+        filename_pattern: "IMD_WIND10M_{year}.nc"
+        # Stored as components; magnitude is derived during assembly so the
+        # channel carries scalar wind speed.
+        u_variable: "u10"
+        v_variable: "v10"
+        derive: "magnitude"
+        units: "m s-1"
+        native_interval_minutes: 180
+
+  # ---------------------------------------------------------------------------
+  # D. Static geophysical priors — time-invariant, read once and broadcast
+  # ---------------------------------------------------------------------------
+  static_priors:
+    enabled: true
+    root: "/data/static"
+    # Optional rasterio/GDAL overview pyramid level to read instead of the
+    # base resolution. null reads the base array.
+    #
+    # This matters for the DEM: Cartosat-1 at full resolution over a
+    # 32-degree box is far larger than the 384 x 384 grid it will be
+    # resampled onto, and reading the base array into memory only to
+    # immediately decimate it is the straightforward way to exhaust RAM.
+    # Reading a pyramid level is cheap and GDAL adjusts the affine transform
+    # to match, so georeferencing stays correct.
+    #
+    # Level 0 is the first overview (typically 2x decimation), 1 the second
+    # (4x), and so on. A level that does not exist in the file falls back to
+    # base resolution with a warning rather than failing.
+    layers:
+      dem_elevation:
+        path: "cartosat_dem_india.tif"
+        format: geotiff
+        description: "Cartosat-1 / SRTM void-filled digital elevation model"
+        units: "m"
+        resampling: "bilinear"       # continuous field
+        fill_value: -32768
+        # Cartosat DEM is the large one; 2 levels is ~4x decimation, still
+        # well finer than the 1/12 degree target grid.
+        overview_level: 2
+      lulc_mask:
+        path: "bhuvan_lulc_india.tif"
+        format: geotiff
+        description: "ISRO Bhuvan Land Use / Land Cover classification"
+        units: "class_index"
+        resampling: "nearest"        # categorical: never interpolate classes
+        fill_value: 0
+        # Categorical rasters must never be decimated by an averaging
+        # pyramid: GDAL overviews are built with averaging by default, which
+        # would blend class indices into values that denote nothing. Read the
+        # base array and let nearest-neighbour reprojection do the reduction.
+        overview_level: null
+      soil_type:
+        path: "icar_soil_india.tif"
+        format: geotiff
+        description: "ICAR soil classification raster"
+        units: "class_index"
+        resampling: "nearest"
+        fill_value: 0
+        # Categorical, same reasoning as lulc_mask.
+        overview_level: null
+
+# -----------------------------------------------------------------------------
+# Target — the ground truth the model is trained and verified against
+#
+# A sibling of `sources:`, never a member of it. Nothing that walks the source
+# list or the channel groups can reach this stream, so no assembly step can
+# stack the answer into the 30-channel input tensor. The separation is
+# structural rather than conventional because the failure it prevents is
+# silent: a model reading its own target scores perfectly and forecasts
+# nothing.
+#
+# Why HEM and not imd_precip. The IMD gauge grid is a *daily accumulation* in
+# mm at 1440-minute cadence, lifted to 30 minutes by hold. Every lead frame
+# inside a day would carry the same number, so the target of a six-hour
+# 30-minute forecast would be piecewise-constant with steps only at midnight,
+# and a 20 mm/day total would read as 20 mm/h against a 15 mm/h heavy-rain
+# threshold. HEM is a genuine rain *rate* at the model's own cadence. Both
+# products stay in the pipeline: imd_precip remains an input channel carrying
+# antecedent wetness, and is never the target.
+# -----------------------------------------------------------------------------
+targets:
+  hem:
+    enabled: true
+    format: hdf5
+    root: "/data/raw/insat3d_hem"
+    # HEM is retrieved from the same INSAT-3D imager pixels as TIR1, so it
+    # inherits the imager's footprint: 888 cells across the 32-degree window is
+    # 0.036036 deg = 4.01 km. Declared rather than discovered, for the same
+    # reason the source shapes are -- a reader must be able to state the
+    # dimensions of a frame it could not read in order to return it masked.
+    native_shape: [888, 888]
+    # Equal to the model cadence, so nothing is interpolated onto the target
+    # grid in time. This is the property that made HEM the right choice: a
+    # temporal lift on a rain rate has to invent intensity between samples.
+    native_interval_minutes: 30
+    # MOSDAC L2B naming, e.g.
+    #   3DIMG_23SEP2017_0600_L2B_HEM_V01R00.h5
+    filename_pattern: "3DIMG_{day:02d}{month_abbr}{year}_{hour:02d}{minute:02d}_L2B_HEM*.h5"
+    variable:
+      name: "hem_rain_rate"
+      # Group layout follows the MOSDAC L2B product specification.
+      path: "/HEM"
+      description: "Hydro Estimator Method surface rain rate"
+      # Locked to a rate in the schema. losses.py and replay_buffer.py both
+      # assume mm h-1, and the heavy-rain threshold is only meaningful against
+      # a rate; refusing any other unit string is what stops a future target in
+      # mm/day from silently reproducing the trap described above.
+      units: "mm h-1"
+      valid_range: [0.0, 300.0]
+      fill_value: -999.0
+    geolocation:
+      latitude_dataset: "/Latitude"
+      longitude_dataset: "/Longitude"
+      subsatellite_lon: 82.0
+      satellite_altitude_km: 35786.0
+    quality_control:
+      # HEM infers rain rate from cloud-top brightness temperature and reports
+      # it at the pixel where the cloud top was *seen*, not where the rain
+      # reaches the ground. It therefore carries the same geostationary
+      # displacement as TIR1 and needs the same correction. Uncorrected, the
+      # target sits tens of kilometres from the truth and the model learns to
+      # forecast the offset faithfully.
+      parallax_correction: true
+      scanline_dropout: true
+      physical_bounds: true
+      # There is deliberately no gap-filling option here, and none in the
+      # schema. A reconstructed target means verifying the model against this
+      # pipeline's own optical flow. A window with any missing target frame is
+      # rejected, never repaired.
+      #
+      # There is likewise no normalisation option. Targets travel in mm h-1
+      # from the reader to the loss, because that is what the loss requires;
+      # normalising and denormalising would be two lossy operations to arrive
+      # exactly where we started.
+
+# -----------------------------------------------------------------------------
+# Quality control
+#
+# Applied per-frame before any spatial harmonisation. Ordering matters:
+# calibration must precede physical clamping, and dropout detection must
+# precede gap filling so a corrupted scan is not treated as valid input.
+# -----------------------------------------------------------------------------
+quality_control:
+  radiometric_calibration:
+    enabled: true
+    # L1C counts -> radiance -> brightness temperature via the per-channel LUT
+    # shipped inside the granule.
+    apply_lut: true
+    lut_interpolation: "linear"
+
+  scanline_dropout:
+    enabled: true
+    # A dropped scan line reads as a row that is constant, saturated, or all
+    # fill. Rows failing these tests are masked, not repaired in place.
+    max_consecutive_fill_rows: 3
+    row_constant_tolerance: 0.01
+    saturation_fraction_threshold: 0.98
+
+  parallax_correction:
+    enabled: true
+    # Geostationary viewing displaces an elevated cloud top away from the
+    # sub-satellite point. Uncorrected, a deep convective core is reported
+    # tens of kilometres from where it actually sits -- unacceptable when the
+    # output feeds district-level warnings.
+    method: "geometric"
+    # Cloud height is derived from CTT against a standard lapse-rate profile
+    # when no explicit cloud-top-height product is available.
+    cloud_height_source: "ctt_lapse_rate"
+    assumed_lapse_rate_k_per_km: 6.5
+    reference_surface_temp_k: 300.0
+
+  physical_bounds:
+    # Hard clamps expressed in physical units. Values outside these are set to
+    # missing rather than clipped: an out-of-range brightness temperature is a
+    # sensor artefact, and clipping it would silently manufacture a plausible
+    # observation where none exists.
+    action: "mask"
+    insat_tir1: [180.0, 340.0]
+    insat_wv: [180.0, 300.0]
+    insat_ctt: [180.0, 320.0]
+    imd_precip: [0.0, 1200.0]      # mm accumulated over a day
+    # mm h-1, an instantaneous rate. A plausibility gate against retrieval
+    # artefacts, not a climatological claim: the highest credibly measured
+    # hourly rainfall is around 305 mm, so anything beyond this is the sensor
+    # or the retrieval, not the weather. Masked rather than clipped, like
+    # everything else here.
+    hem_rain_rate: [0.0, 300.0]
+    temp_2m: [220.0, 330.0]
+    rh_2m: [0.0, 100.0]
+    wind_10m: [0.0, 120.0]
+    u: [-150.0, 150.0]
+    v: [-150.0, 150.0]
+    t: [180.0, 340.0]
+    rh: [0.0, 100.0]
+    z: [0.0, 20000.0]
+
+  gap_filling:
+    # Missing frames are reconstructed from the observations that bracket them.
+    # Never from noise, never from a generative prior: a hallucinated frame in
+    # the input window becomes a hallucinated storm in the forecast.
+    enabled: true
+    strategy: "optical_flow"      # optical_flow | spline | none
+    # Farneback dense flow between the bracketing frames, advected to the
+    # target timestamp. Falls back to the spline path when only one side of
+    # the gap is available.
+    optical_flow:
+      method: "farneback"
+      pyramid_scale: 0.5
+      levels: 3
+      window_size: 15
+      iterations: 3
+      poly_n: 5
+      poly_sigma: 1.2
+    spline:
+      order: 3
+      bidirectional: true
+    # Beyond this, the sequence is rejected outright. Interpolating across
+    # more than one hour of a rapidly evolving convective field produces a
+    # smooth fiction, and training on it teaches the model that storms glide.
+    max_consecutive_missing_frames: 2
+    reject_sequence_if_exceeded: true

@@ -1,0 +1,214 @@
+# =============================================================================
+# Stage 2 — Spatial harmonisation, normalisation and 5D tensor assembly
+#
+# Consumes the quality-controlled streams declared in ingestion.yaml and emits
+# the tensor the fusion model consumes:
+#
+#     X in R^(B x T x C x H x W)  =  B x 13 x 30 x 384 x 384
+#
+# The channel order below is load-bearing. It fixes the meaning of every index
+# in dimension C, and it is read by the dataset, the model input projection,
+# the XAI attribution labels and the API response schema. Reordering it
+# silently invalidates every trained checkpoint.
+# =============================================================================
+
+target_grid:
+  crs: "EPSG:4326"
+  lat_min: 6.0
+  lat_max: 38.0
+  lon_min: 68.0
+  lon_max: 100.0
+  height: 384
+  width: 384
+  resolution_deg: 0.0833333333333333
+  # Cell centres, offset half a pixel from the box edge. Stated explicitly
+  # because sampling on the edges instead of the centres shifts every field by
+  # half a cell -- a systematic ~4.6 km bias that no downstream check catches.
+  cell_alignment: "center"
+
+reprojection:
+  # Continuous geophysical fields interpolate; categorical rasters must not.
+  # Bilinearly resampling a land-cover class index produces class 4.7, which
+  # denotes nothing.
+  resampling_by_kind:
+    continuous: "bilinear"
+    categorical: "nearest"
+    precipitation: "bilinear"
+  # INSAT native geolocation is a curvilinear geostationary projection rather
+  # than a regular grid, so it is warped by explicit lat/lon lookup rather than
+  # by an affine transform.
+  insat_regrid_method: "curvilinear_lookup"
+  # IMDAA is distributed on Lambert Conformal Conic in some releases and
+  # geographic in others; the reader detects and reprojects as needed.
+  imdaa_source_crs_autodetect: true
+  fallback_source_crs: "EPSG:4326"
+  nodata_policy: "propagate"     # a hole stays a hole; it is not filled here
+
+temporal_interpolation:
+  # Sources coarser than 30 minutes are lifted onto the model cadence here.
+  # Precipitation is held rather than linearly blended: linear interpolation
+  # of a daily rainfall total across 48 slots invents a drizzle that never
+  # occurred and destroys the intensity distribution the model must learn.
+  method_by_kind:
+    continuous: "linear"
+    precipitation: "hold"
+    categorical: "hold"
+  extrapolate: false
+
+# -----------------------------------------------------------------------------
+# Channel specification — C = 30, in this exact order
+# -----------------------------------------------------------------------------
+channels:
+  count: 30
+
+  # -- Dynamic satellite, indices 0-2 ----------------------------------------
+  satellite:
+    indices: [0, 1, 2]
+    kind: continuous
+    normalization: minmax
+    names:
+      - insat_tir1
+      - insat_wv
+      - insat_ctt
+
+  # -- Dynamic NWP (IMDAA), indices 3-22 -------------------------------------
+  # Grouped by variable then ascending pressure level, so a slice of four
+  # consecutive channels is always one variable's vertical profile. That makes
+  # shear and thickness diagnostics contiguous reads.
+  nwp:
+    indices: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
+    kind: continuous
+    normalization: zscore
+    names:
+      - u200
+      - u500
+      - u700
+      - u850
+      - v200
+      - v500
+      - v700
+      - v850
+      - t200
+      - t500
+      - t700
+      - t850
+      - rh200
+      - rh500
+      - rh700
+      - rh850
+      - z200
+      - z500
+      - z700
+      - z850
+
+  # -- Dynamic surface (IMD), indices 23-26 ----------------------------------
+  surface:
+    indices: [23, 24, 25, 26]
+    kind: continuous
+    normalization: zscore
+    # Precipitation is bounded below at zero and heavy-tailed, so it is
+    # log1p-compressed before standardisation. Without it the loss is
+    # dominated by a handful of convective cores.
+    per_channel_overrides:
+      imd_precip:
+        transform: log1p
+        normalization: minmax
+    names:
+      - imd_precip
+      - temp_2m
+      - rh_2m
+      - wind_10m
+
+  # -- Static geophysical priors, indices 27-29 ------------------------------
+  # Time-invariant. Read once and broadcast across all T frames rather than
+  # stored per timestep.
+  static:
+    indices: [27, 28, 29]
+    broadcast_over_time: true
+    names:
+      - dem_elevation
+      - lulc_mask
+      - soil_type
+    per_channel_overrides:
+      dem_elevation:
+        kind: continuous
+        normalization: minmax
+      lulc_mask:
+        kind: categorical
+        normalization: none      # class indices are not scaled
+        encoding: "ordinal"      # one-hot expansion happens in the model stem
+      soil_type:
+        kind: categorical
+        normalization: none
+        encoding: "ordinal"
+
+# -----------------------------------------------------------------------------
+# Climatological normalisation
+#
+# Statistics are computed once by a production climatology job and written to
+# the file below. They are NOT defined in this repository: fabricating a mean
+# and standard deviation would silently bias every field the model ever sees.
+#
+# The loader raises if stats_path is absent. It does not fall back to computing
+# statistics from the current batch, which would leak information across the
+# temporal split and make validation meaningless.
+#
+# The reference period stops at the end of the 2019 monsoon, one season short
+# of the record the dataset spans. That is deliberate. JJAS 2020 is the
+# held-out validation season, and statistics fitted over it would normalise
+# every 2020 field by a mean and standard deviation that had already seen it --
+# the same leak the paragraph above refuses in its faster form, and aimed
+# squarely at the inter-annual generalisation claim the split exists to
+# support.
+# -----------------------------------------------------------------------------
+normalization:
+  stats_path: "configs/climatology/monsoon_17_19_stats.json"
+  reference_period:
+    start: "2017-06-01"
+    end: "2019-09-30"
+    # June-September only. Without this the period would assert coverage of
+    # three dry seasons that carry no monsoon and no record; a climatology
+    # averaged over those months would be a different quantity entirely.
+    months: [6, 7, 8, 9]
+  # zscore for atmospheric continuous variables: preserves thermodynamic
+  # gradients and the extreme tails a nowcaster depends on.
+  # minmax for bounded satellite brightness temperatures and static rasters,
+  # whose physical ranges are known a priori and fixed.
+  method:
+    atmospheric: "zscore"
+    satellite: "minmax"
+    static: "minmax"
+  # Expected schema of the stats file, per channel name:
+  #   {"<channel>": {"mean": <float>, "std": <float>,
+  #                  "min": <float>, "max": <float>,
+  #                  "count": <int>, "source": "<provenance string>"}}
+  stats_schema:
+    required_keys: ["mean", "std", "min", "max"]
+    optional_keys: ["count", "source", "percentiles"]
+  # Guards against a degenerate statistic silently producing infinities.
+  epsilon: 1.0e-6
+  min_std: 1.0e-3
+  # Populated only where a channel has a genuine, externally documented
+  # physical range. Left empty here rather than filled with invented numbers;
+  # the loader treats an empty mapping as "no fallback available" and requires
+  # the stats file for that channel.
+  fallback_bounds: {}
+  fallback_moments: {}
+  clip_to_sigma: 6.0     # applied after standardisation, to outliers only
+
+# -----------------------------------------------------------------------------
+# 5D tensor assembly
+# -----------------------------------------------------------------------------
+tensor:
+  layout: "B T C H W"
+  sequence_length: 13
+  channels: 30
+  height: 384
+  width: 384
+  dtype: "float32"
+  # Missing values survive normalisation as NaN and are replaced here, after a
+  # companion validity mask has been recorded. The model sees zeros; the loss
+  # sees the mask and ignores those cells.
+  nan_fill_value: 0.0
+  emit_validity_mask: true
+  mask_layout: "B T 1 H W"
